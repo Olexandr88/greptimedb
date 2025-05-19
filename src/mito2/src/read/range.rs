@@ -46,12 +46,12 @@ pub(crate) struct SourceIndex {
 
 /// Index to access a row group.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RowGroupIndex {
+pub struct RowGroupIndex {
     /// Index to the memtable/file.
     pub(crate) index: usize,
     /// Row group index in the file.
     /// Negative index indicates all row groups.
-    pub(crate) row_group_index: i64,
+    pub row_group_index: i64,
 }
 
 /// Meta data of a partition range.
@@ -97,6 +97,9 @@ impl RangeMeta {
         Self::push_seq_mem_ranges(&input.memtables, &mut ranges);
         Self::push_seq_file_ranges(input.memtables.len(), &input.files, &mut ranges);
 
+        #[cfg(feature = "enterprise")]
+        Self::push_extension_ranges(input.extension_ranges(), &mut ranges);
+
         let ranges = group_ranges_for_seq_scan(ranges);
         if compaction || input.distribution == Some(TimeSeriesDistribution::PerSeries) {
             // We don't split ranges in compaction or TimeSeriesDistribution::PerSeries.
@@ -115,6 +118,9 @@ impl RangeMeta {
             &input.cache_strategy,
             &mut ranges,
         );
+
+        #[cfg(feature = "enterprise")]
+        Self::push_extension_ranges(input.extension_ranges(), &mut ranges);
 
         ranges
     }
@@ -313,6 +319,28 @@ impl RangeMeta {
             });
         }
     }
+
+    #[cfg(feature = "enterprise")]
+    fn push_extension_ranges(
+        ranges: &[crate::extension::BoxedExtensionRange],
+        metas: &mut Vec<RangeMeta>,
+    ) {
+        for range in ranges.iter() {
+            let index = metas.len();
+            metas.push(RangeMeta {
+                time_range: range.time_range(),
+                indices: smallvec![SourceIndex {
+                    index,
+                    num_row_groups: range.num_row_groups(),
+                }],
+                row_group_indices: smallvec![RowGroupIndex {
+                    index,
+                    row_group_index: ALL_ROW_GROUPS,
+                }],
+                num_rows: range.num_rows() as usize,
+            });
+        }
+    }
 }
 
 /// Groups ranges by time range.
@@ -366,7 +394,7 @@ fn maybe_split_ranges_for_seq_scan(ranges: Vec<RangeMeta>) -> Vec<RangeMeta> {
 
 /// Builder to create file ranges.
 #[derive(Default)]
-pub(crate) struct FileRangeBuilder {
+pub struct FileRangeBuilder {
     /// Context for the file.
     /// None indicates nothing to read.
     context: Option<FileRangeContextRef>,
@@ -385,7 +413,7 @@ impl FileRangeBuilder {
 
     /// Builds file ranges to read.
     /// Negative `row_group_index` indicates all row groups.
-    pub(crate) fn build_ranges(&self, row_group_index: i64, ranges: &mut SmallVec<[FileRange; 2]>) {
+    pub fn build_ranges(&self, row_group_index: i64, ranges: &mut SmallVec<[FileRange; 2]>) {
         let Some(context) = self.context.clone() else {
             return;
         };
@@ -485,7 +513,8 @@ impl RangeBuilderList {
         match builder_opt {
             Some(builder) => builder.build_ranges(index.row_group_index, &mut ranges),
             None => {
-                let builder = input.prune_file(file_index, reader_metrics).await?;
+                let file = &input.files[file_index];
+                let builder = input.prune_file(file, reader_metrics).await?;
                 builder.build_ranges(index.row_group_index, &mut ranges);
                 self.set_file_builder(file_index, Arc::new(builder));
             }
